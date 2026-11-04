@@ -1,0 +1,154 @@
+name: Build VUMister NAM (Windows x64) - NAM, NAM A2, WAV (v51, no installer; main UI only)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vumister-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build and package VST3 - v51
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Validate source and supported file types
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $required = @(
+            'CMakeLists.txt',
+            'README.md',
+            'Source/PluginProcessor.cpp',
+            'Source/PluginProcessor.h',
+            'Source/PluginEditor.cpp',
+            'Source/PluginEditor.h',
+            'Assets/reference_full_interface.png',
+            'Models'
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path -LiteralPath $file)) { throw "Required project path is missing: $file" }
+          }
+          $editor = Get-Content -LiteralPath 'Source/PluginEditor.cpp' -Raw
+          $header = Get-Content -LiteralPath 'Source/PluginProcessor.h' -Raw
+          $processor = Get-Content -LiteralPath 'Source/PluginProcessor.cpp' -Raw
+          $cmake = Get-Content -LiteralPath 'CMakeLists.txt' -Raw
+          if ($editor -match 'guiScaleButtons\s*\[[^\]]+\]\s*\.setFont\s*\(') {
+            throw 'Invalid JUCE API: TextButton has no setFont() member. Configure button fonts through a LookAndFeel instead.'
+          }
+
+          if ($editor -notmatch '\.nam' -or
+              $editor -notmatch '\.gen' -or
+              $editor -notmatch '\.wav' -or
+              $editor -notmatch 'loadNamFile' -or
+              $editor -notmatch 'loadAudioFile' -or
+              $editor -match 'Use DAW input') {
+            throw 'LOAD NAM must support NAM, NAM A2, and WAV without the removed DAW-input menu item.'
+          }
+          if ($editor -match 'vuOnlyButton|vuOnlyMode|SHOW ALL|VU ONLY' -or
+              $header -match 'vuOnlyButton|vuOnlyMode') {
+            throw 'Obsolete compact-mode code must not be present in the main-only editor.'
+          }
+          if ($editor -notmatch 'setSize \(761, 416\)' -or
+              $editor -notmatch 'setResizable \(false, false\)' -or
+              $editor -notmatch 'setResizeLimits \(761, 416, 761, 416\)') {
+            throw 'The main editor must remain fixed at 50% reference size (761 x 416).'
+          }
+          if ($header -notmatch 'bool loadNamFile \(const juce::File& file\)' -or
+              $header -notmatch 'bool loadAudioFile \(const juce::File& file\)' -or
+              $header -notmatch 'void clearAudioFile\(\)' -or
+              $header -notmatch 'struct LoadedAudioFile' -or
+              $processor -notmatch 'formats\.registerFormat \(new juce::WavAudioFormat\(\), true\)' -or
+              $processor -notmatch 'Unsupported audio file: choose \.wav only' -or
+              $processor -notmatch 'extension\.compareIgnoreCase \("\.nam"\)' -or
+              $processor -notmatch 'extension\.compareIgnoreCase \("\.gen"\)' -or
+              $processor -notmatch '512 MiB decoded limit' -or
+              $processor -notmatch 'audioPlaybackPosition' -or
+              $processor -notmatch 'std::atomic_store \(&loadedAudio, candidate\)') {
+            throw 'WAV decoding, bounded memory use, looping/resampling, or thread-safe source publication is missing.'
+          }
+          if ($processor -notmatch 'modelLoader->CreateFromFile' -or
+              $processor -notmatch 'Invalid model file: choose \.nam \(NAM\) or \.gen \(NAM A2\)' -or
+              $processor -notmatch 'NAM A2 model loaded and running') {
+            throw 'NAM and NAM A2 model loading and extension validation must remain enabled.'
+          }
+          if ($cmake -notmatch 'juce::juce_audio_formats' -or $cmake -notmatch 'FORMATS VST3 Standalone') {
+            throw 'JUCE audio formats and VST3 target must be linked.'
+          }
+          if (-not (Get-ChildItem -LiteralPath 'Assets' -Filter '*.png' -Recurse -File)) { throw 'No PNG artwork found under Assets/.' }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is not available.' }
+          git --version
+          if ($LASTEXITCODE -ne 0) { throw 'Git is not available.' }
+
+      - name: Configure CMake (Visual Studio 2022 x64)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 2>&1 | Tee-Object -FilePath configure.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { Get-Content -LiteralPath 'configure.log' -Tail 160; throw "CMake configure failed with exit code $code. See configure.log." }
+
+      - name: Build VST3 (Release)
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmake --build build --config Release --parallel 2 --verbose 2>&1 | Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          if (Test-Path -LiteralPath 'build.log') {
+            Select-String -Path 'build.log' -Pattern 'error C[0-9]+:|fatal error|: error:|LNK[0-9]+|FAILED:|CMake Error|undefined reference' -Context 1,2 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.ToString() }
+          }
+          if ($code -ne 0) { Get-Content -LiteralPath 'build.log' -Tail 240; throw "Build failed with exit code $code. See build.log." }
+
+      - name: Verify and package VST3 bundle
+        if: success()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundles = @(Get-ChildItem -LiteralPath 'build' -Recurse -Directory -Filter '*.vst3' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '[\\/](_deps|CMakeFiles)[\\/]' })
+          $bundle = $bundles | Where-Object { $_.Name -eq 'VU Mister NAM.vst3' } | Select-Object -First 1
+          if ($null -eq $bundle) { $bundle = $bundles | Where-Object { $_.FullName -match 'VUMisterNAM_artefacts[\\/]Release[\\/]VST3' } | Select-Object -First 1 }
+          if ($null -eq $bundle) { throw 'Could not find the built VST3 bundle. See build.log.' }
+          $dist = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $zipPath = Join-Path $dist 'VUMister-NAM-VST3-Windows-x64.zip'
+          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+          Compress-Archive -Path (Join-Path $bundle.FullName '*') -DestinationPath $zipPath -CompressionLevel Optimal
+          if ((Get-Item -LiteralPath $zipPath).Length -le 0) { throw 'VST3 ZIP archive is empty.' }
+          Write-Host "VST3 bundle: $($bundle.FullName)"
+          Write-Host "VST3 ZIP: $zipPath"
+
+      - name: Upload VST3 artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VUMisterNAM-Windows-x64-VST3
+          path: dist/VUMister-NAM-VST3-Windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VUMisterNAM-Windows-x64-Diagnostics
+          path: |
+            configure.log
+            build.log
+            build/CMakeCache.txt
+          if-no-files-found: ignore
+          retention-days: 14
